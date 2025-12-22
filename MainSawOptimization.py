@@ -32,6 +32,29 @@ def transform_optimized_to_machine_readable(optimized_df: pd.DataFrame) -> pd.Da
     # Trim string cells
     df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
 
+    def _round_half_up_whole_number(value, default: str = "0") -> str:
+        """Round to nearest whole number using HALF-UP.
+
+        Examples:
+        - 1044.7 -> 1045
+        - 1044.3 -> 1044
+        - 1044.5 -> 1045
+        """
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return default
+        s = str(value).strip()
+        if s == "":
+            return default
+        try:
+            from decimal import Decimal, ROUND_HALF_UP
+
+            # Use string -> Decimal to avoid binary float rounding surprises.
+            d = Decimal(s)
+            return str(int(d.quantize(Decimal("1"), rounding=ROUND_HALF_UP)))
+        except Exception:
+            # If it can't be parsed, keep original (but still return a string).
+            return s
+
     def find_col(*names: str) -> str | None:
         lowered = {str(c).strip().lower(): c for c in df.columns}
         for name in names:
@@ -106,11 +129,11 @@ def transform_optimized_to_machine_readable(optimized_df: pd.DataFrame) -> pd.Da
     for k in range(1, max_items + 1):
         idx = k - 1
         rows.append([f"204_HMI_Scheme_ProjectData_PerformData{{{k}}}.length"]
-                    + [(get_val(g, idx, col_length, "0") or "0") for g in kept_groups])
+                    + [_round_half_up_whole_number(get_val(g, idx, col_length, "0"), default="0") for g in kept_groups])
         rows.append([f"204_HMI_Scheme_ProjectData_PerformData{{{k}}}.angle2"] + ["0"] * num_pages)
         rows.append([f"204_HMI_Scheme_ProjectData_PerformData{{{k}}}.angle1"] + ["0"] * num_pages)
         rows.append([f"204_HMI_Scheme_ProjectData_PerformData{{{k}}}.quantity"]
-                    + [(get_val(g, idx, col_qty, "1") or "1") for g in kept_groups])
+                    + ["1"] * num_pages)
 
     for k in range(1, max_items + 1):
         idx = k - 1
