@@ -5,7 +5,7 @@ import streamlit as st
 from datetime import datetime
 
 # ---------------- Config ----------------
-STOCK = 4700.0
+STOCK = 4800.0
 MIN_REUSE = 330.0            # strictly > 330 mm is reusable
 MEMORY_FILE = "offcut_memory.csv"  # local CSV for persistent offcuts
 APP_TITLE = "🪚 Cut Batch Optimizer (with Offcut Memory)"
@@ -121,7 +121,7 @@ def transform_optimized_to_machine_readable(optimized_df: pd.DataFrame) -> pd.Da
     rows.append(["204_HMI_Scheme_ProjectData_EngInfo"] + ["1"] * num_pages)
     rows.append(["204_HMI_Scheme_ProjectData_ProfileName"] + [get_val(g, 0, col_material, "") for g in kept_groups])
     rows.append(["204_HMI_Scheme_ProjectData_ProfileCode"] + ["0"] * num_pages)
-    rows.append(["204_HMI_Scheme_ProjectData_RawLength"] + ["4870"] * num_pages)
+    rows.append(["204_HMI_Scheme_ProjectData_RawLength"] + ["4800"] * num_pages)
     rows.append(["204_HMI_Scheme_ProjectData_RawHeight"] + ["0"] * num_pages)
     rows.append(["204_HMI_Scheme_ProjectData_RawWidth"] + ["0"] * num_pages)
     rows.append(["204_HMI_Scheme_ProjectData_Amount"] + ["0"] * num_pages)
@@ -586,3 +586,4 @@ if uploaded is not None:
             st.info("No reusable offcuts generated (all cuts used full stock or waste < 330mm)")
 else:
     st.info("Upload an Excel or CSV file to begin.")
+
