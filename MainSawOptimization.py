@@ -87,16 +87,8 @@ def transform_optimized_to_machine_readable(optimized_df: pd.DataFrame) -> pd.Da
     first_rows = df.groupby(col_group, sort=False).head(1).reset_index(drop=True)
     group_order = list(first_rows[col_group].astype(str))
 
-    # Stop BEFORE first group whose first row material starts with FCT
-    stop_at_idx = None
-    for idx, g in enumerate(group_order):
-        gdf = df[df[col_group].astype(str) == str(g)]
-        if not gdf.empty:
-            mat = str(gdf.iloc[0][col_material] or "").upper()
-            if mat.startswith("FCT"):
-                stop_at_idx = idx
-                break
-    kept_groups = group_order[:stop_at_idx] if stop_at_idx is not None else group_order
+    # Export ALL groups (no special stop condition)
+    kept_groups = group_order
 
     group_rows = {str(g): df[df[col_group].astype(str) == str(g)].reset_index(drop=True) for g in kept_groups}
     num_pages = len(kept_groups)
@@ -383,6 +375,52 @@ def optimize_one_material(subdf: pd.DataFrame, mem_pool: list[float]) -> tuple[p
     # return assignments + updated pool
     return pd.DataFrame(rows), offcuts
 
+
+def _normalize_offcut_inventory(offcut_df: pd.DataFrame | None, precut_default: float) -> pd.DataFrame:
+    """Normalize uploaded offcut inventory to columns: material, offcut_length, precut_mm.
+
+    - Accepts flexible column naming/casing.
+    - Drops rows with non-numeric offcut_length.
+    - Fills missing precut_mm with precut_default.
+    """
+    if offcut_df is None or getattr(offcut_df, "empty", True):
+        return pd.DataFrame(columns=["material", "offcut_length", "precut_mm"])
+
+    tmp = offcut_df.copy()
+    tmp.columns = [str(c).strip() for c in tmp.columns]
+    lowered = {str(c).strip().lower(): c for c in tmp.columns}
+
+    def pick_col(*names: str) -> str | None:
+        for n in names:
+            key = str(n).strip().lower()
+            if key in lowered:
+                return lowered[key]
+        return None
+
+    col_material = pick_col("material")
+    col_length = pick_col("offcut_length", "offcutlength", "offcut", "length")
+    col_precut = pick_col("precut_mm", "precutmm", "precut")
+
+    if not col_material or not col_length:
+        return pd.DataFrame(columns=["material", "offcut_length", "precut_mm"])
+
+    keep_cols = [col_material, col_length] + ([col_precut] if col_precut else [])
+    norm = tmp[keep_cols].rename(columns={
+        col_material: "material",
+        col_length: "offcut_length",
+        (col_precut or ""): "precut_mm",
+    })
+
+    norm["material"] = norm["material"].astype(str).str.strip()
+    norm["offcut_length"] = pd.to_numeric(norm["offcut_length"], errors="coerce")
+    if "precut_mm" not in norm.columns:
+        norm["precut_mm"] = precut_default
+    else:
+        norm["precut_mm"] = pd.to_numeric(norm["precut_mm"], errors="coerce").fillna(precut_default)
+
+    norm = norm[norm["offcut_length"].notna()].copy()
+    return norm
+
 def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precut_mm: float):
     """
     df_in: uploaded batch (any columns; needs at least 'length' and optional 'material')
@@ -400,14 +438,17 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
     df["length"] = pd.to_numeric(df["length"], errors="coerce")
     valid = df[df["length"].notna()].copy()
 
-    # Build material order
+    # Normalize offcut memory/inventory input
+    offcut_mem_df = _normalize_offcut_inventory(offcut_mem_df, precut_default=precut_mm)
+
+    # Build material order (only materials in this batch)
     materials = list(valid["material"].astype(str).drop_duplicates())
 
     # Build a dict of offcut pools per material from memory
     mem_pools = {m: [] for m in materials}
     if not offcut_mem_df.empty:
         for m in materials:
-            pool = offcut_mem_df.loc[offcut_mem_df["material"] == m, "offcut_length"].tolist()
+            pool = offcut_mem_df.loc[offcut_mem_df["material"].astype(str) == str(m), "offcut_length"].tolist()
             # (precut policy: we are *storing* precut, not subtracting from capacity now)
             mem_pools[m] = pool
 
@@ -453,17 +494,36 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
     check["ok_single_material"] = ~check["materials"].str.contains(",")
 
     # --- Update offcut memory for NEXT batches ---
-    # 1) Start from remaining pools (unused offcuts from previous memory)
+    # IMPORTANT: Offcuts for materials NOT in this batch must still carry forward.
+    batch_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    timestamp = datetime.now().isoformat(timespec="seconds")
+
     new_mem_records = []
+
+    # 1) Carry forward uploaded offcuts for materials not present in this cut batch
+    if not offcut_mem_df.empty:
+        carryover_other = offcut_mem_df.loc[~offcut_mem_df["material"].isin(materials)].copy()
+        carryover_other = carryover_other[carryover_other["offcut_length"] > MIN_REUSE]
+        for _, r in carryover_other.iterrows():
+            new_mem_records.append({
+                "material": r["material"],
+                "offcut_length": float(r["offcut_length"]),
+                "precut_mm": float(r.get("precut_mm", precut_mm)),
+                "batch_id": batch_id,
+                "timestamp": timestamp,
+            })
+
+    # 2) Add remaining pools (unused + newly generated offcuts) for materials in this batch
     for m, pool in updated_pools.items():
         for oc in pool:
-            new_mem_records.append({
-                "material": m,
-                "offcut_length": oc,
-                "precut_mm": precut_mm,
-                "batch_id": datetime.now().strftime("%Y%m%d-%H%M%S"),
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-            })
+            if oc > MIN_REUSE:
+                new_mem_records.append({
+                    "material": m,
+                    "offcut_length": oc,
+                    "precut_mm": precut_mm,
+                    "batch_id": batch_id,
+                    "timestamp": timestamp,
+                })
 
     # 2) Create DataFrame (no longer saving to file for cloud hosting)
     new_mem_df = pd.DataFrame(new_mem_records, columns=["material", "offcut_length", "precut_mm", "batch_id", "timestamp"])
@@ -586,4 +646,3 @@ if uploaded is not None:
             st.info("No reusable offcuts generated (all cuts used full stock or waste < 330mm)")
 else:
     st.info("Upload an Excel or CSV file to begin.")
-
