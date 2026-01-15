@@ -18,14 +18,11 @@ EXCLUDED_MATERIALS = {
 
 # Materials that must be exported to a separate file and optimized last.
 # Matching policy:
-# 1) exact match to full material string (after trim)
-# 2) else match by prefix (segment before first '.')
+# - exact match to full material string (after trim)
 SAW13_MATERIAL_CODES = {
     "5760.05.00.4880",
     "5762.05.00.4880",
     "5901.05.00.4880",
-    "5903.05.00.4880",
-    "5915.05.00.4880",
     "5919.05.33.4880",
     "5956.05.00.4880",
     "5969.05.00.4880",
@@ -34,7 +31,43 @@ SAW13_MATERIAL_CODES = {
     "4760.05.00.4880",
     "4762.05.00.4880",
 }
-SAW13_PREFIXES = {c.split(".")[0].lstrip("0") for c in SAW13_MATERIAL_CODES}
+
+# Tiger Stop Saw machine materials (exact match)
+TIGERSTOP_MATERIAL_CODES = {
+    "5883.05.00.4880",
+    "5825.05.00.4880",
+    "5772.05.00.4880",
+    "5872.05.00.4880",
+    "5890.05.00.4880",
+    "5826.05.00.4880",
+    "5881.05.00.4880",
+    "5828.05.00.4880",
+    "5801.05.00.4880",
+    "5803.05.00.4880",
+    "5959.05.00.4880",
+    "5770.05.00.4880",
+    "5928.05.00.4880",
+    "5832.05.00.4880",
+    "5846.05.00.4880",
+    "5903.05.00.4880",
+    "5915.05.00.4880",
+    "5856.05.00.4880",
+    "5841.05.00.4880",
+    "5853.05.00.4880",
+    "5821.05.00.4880",
+    "5852.05.00.4880",
+    "5873.05.00.4880",
+    "5960.05.00.4880",
+    "5967.05.00.4880",
+    "4761.05.00.4880",
+    "1880.05.00.4880",
+    "1809.05.00.4880",
+    "1830.05.00.4880",
+    "1831.05.00.4880",
+    "1821.05.00.4880",
+    "8852.00.00.4880",
+    "9847.00.00.4880",
+}
 
 
 def is_saw13_material(material_value) -> bool:
@@ -44,11 +77,16 @@ def is_saw13_material(material_value) -> bool:
     if not s:
         return False
 
-    if s in SAW13_MATERIAL_CODES:
-        return True
+    return s in SAW13_MATERIAL_CODES
 
-    prefix = s.split(".")[0].strip().lstrip("0")
-    return prefix in SAW13_PREFIXES
+
+def is_tigerstop_material(material_value) -> bool:
+    if material_value is None or (isinstance(material_value, float) and pd.isna(material_value)):
+        return False
+    s = str(material_value).strip()
+    if not s:
+        return False
+    return s in TIGERSTOP_MATERIAL_CODES
 
 
 def is_excluded_material(material_value) -> bool:
@@ -512,6 +550,7 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
         out_export = out.drop(columns=[c for c in out.columns if c in export_cols_to_drop or c in unnamed_cols], errors="ignore")
 
         check_main = pd.DataFrame(columns=["optimized_group", "capacity", "sum_lengths", "material", "materials", "ok_capacity", "ok_single_material"])
+        check_tigerstop = check_main.copy()
         check_saw13 = check_main.copy()
 
         offcut_mem_df = _normalize_offcut_inventory(offcut_mem_df, precut_default=precut_mm)
@@ -537,20 +576,28 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
             check_main.to_excel(writer, sheet_name="Checks", index=False)
         main_excel_buf.seek(0)
 
+        tigerstop_excel_buf = io.BytesIO()
+        with pd.ExcelWriter(tigerstop_excel_buf, engine="openpyxl") as writer:
+            out_export.iloc[0:0].to_excel(writer, sheet_name="Tiger Stop Saw", index=False)
+            check_tigerstop.to_excel(writer, sheet_name="Checks", index=False)
+        tigerstop_excel_buf.seek(0)
+
         saw13_excel_buf = io.BytesIO()
         with pd.ExcelWriter(saw13_excel_buf, engine="openpyxl") as writer:
             out_export.iloc[0:0].to_excel(writer, sheet_name="saw #13", index=False)
             check_saw13.to_excel(writer, sheet_name="Checks", index=False)
         saw13_excel_buf.seek(0)
 
-        return out, check_main, check_saw13, main_excel_buf, saw13_excel_buf, new_mem_df
+        return out, check_main, check_tigerstop, check_saw13, main_excel_buf, tigerstop_excel_buf, saw13_excel_buf, new_mem_df
 
     # Build material order (only materials in this batch).
-    # IMPORTANT: optimize Saw #13 materials last to avoid interleaving groups.
+    # IMPORTANT: optimize special machines at the end to avoid interleaving groups.
     materials = list(valid["material"].astype(str).drop_duplicates())
-    materials_main = [m for m in materials if not is_saw13_material(m)]
+    materials_main = [m for m in materials if (not is_saw13_material(m)) and (not is_tigerstop_material(m))]
+    materials_tigerstop = [m for m in materials if is_tigerstop_material(m)]
     materials_saw13 = [m for m in materials if is_saw13_material(m)]
-    materials_ordered = materials_main + materials_saw13
+    # Keep Saw #13 last (as requested earlier), TigerStop just before it.
+    materials_ordered = materials_main + materials_tigerstop + materials_saw13
 
     # Build a dict of offcut pools per material from memory
     mem_pools = {m: [] for m in materials_ordered}
@@ -592,7 +639,7 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
     unnamed_cols = {c for c in out.columns if str(c).strip().lower().startswith("unnamed")}
     out_export = out.drop(columns=[c for c in out.columns if c in export_cols_to_drop or c in unnamed_cols], errors="ignore")
 
-    # Build checks (split: main vs Saw #13) to avoid confusion
+    # Build checks (split: main vs TigerStop vs Saw #13) to avoid confusion
     check_all = (
         out.groupby("optimized_group")
         .agg(
@@ -606,9 +653,11 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
     check_all["ok_capacity"] = check_all["sum_lengths"] <= check_all["capacity"] + 1e-9
     check_all["ok_single_material"] = ~check_all["materials"].str.contains(",")
     check_all["is_saw13"] = check_all["material"].apply(is_saw13_material)
+    check_all["is_tigerstop"] = check_all["material"].apply(is_tigerstop_material)
 
-    check_main = check_all.loc[~check_all["is_saw13"]].drop(columns=["is_saw13"]).reset_index(drop=True)
-    check_saw13 = check_all.loc[check_all["is_saw13"]].drop(columns=["is_saw13"]).reset_index(drop=True)
+    check_main = check_all.loc[~(check_all["is_saw13"] | check_all["is_tigerstop"])].drop(columns=["is_saw13", "is_tigerstop"]).reset_index(drop=True)
+    check_tigerstop = check_all.loc[check_all["is_tigerstop"]].drop(columns=["is_saw13", "is_tigerstop"]).reset_index(drop=True)
+    check_saw13 = check_all.loc[check_all["is_saw13"]].drop(columns=["is_saw13", "is_tigerstop"]).reset_index(drop=True)
 
     # --- Update offcut memory for NEXT batches ---
     # IMPORTANT: Offcuts for materials NOT in this batch must still carry forward.
@@ -645,9 +694,11 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
     # 2) Create DataFrame (no longer saving to file for cloud hosting)
     new_mem_df = pd.DataFrame(new_mem_records, columns=["material", "offcut_length", "precut_mm", "batch_id", "timestamp"])
 
-    # 3) Split export into 2 separate files
+    # 3) Split export into 3 separate files
     saw13_mask = out_export["material"].apply(is_saw13_material)
-    out_export_main = out_export.loc[~saw13_mask].reset_index(drop=True)
+    tiger_mask = out_export["material"].apply(is_tigerstop_material)
+    out_export_main = out_export.loc[~(saw13_mask | tiger_mask)].reset_index(drop=True)
+    out_export_tigerstop = out_export.loc[tiger_mask].reset_index(drop=True)
     out_export_saw13 = out_export.loc[saw13_mask].reset_index(drop=True)
 
     main_excel_buf = io.BytesIO()
@@ -656,13 +707,19 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
         check_main.to_excel(writer, sheet_name="Checks", index=False)
     main_excel_buf.seek(0)
 
+    tigerstop_excel_buf = io.BytesIO()
+    with pd.ExcelWriter(tigerstop_excel_buf, engine="openpyxl") as writer:
+        out_export_tigerstop.to_excel(writer, sheet_name="Tiger Stop Saw", index=False)
+        check_tigerstop.to_excel(writer, sheet_name="Checks", index=False)
+    tigerstop_excel_buf.seek(0)
+
     saw13_excel_buf = io.BytesIO()
     with pd.ExcelWriter(saw13_excel_buf, engine="openpyxl") as writer:
         out_export_saw13.to_excel(writer, sheet_name="saw #13", index=False)
         check_saw13.to_excel(writer, sheet_name="Checks", index=False)
     saw13_excel_buf.seek(0)
 
-    return out, check_main, check_saw13, main_excel_buf, saw13_excel_buf, new_mem_df
+    return out, check_main, check_tigerstop, check_saw13, main_excel_buf, tigerstop_excel_buf, saw13_excel_buf, new_mem_df
 
 # ---------- Run when file uploaded ----------
 if uploaded is not None:
@@ -689,11 +746,11 @@ if uploaded is not None:
             offcut_to_use = pd.DataFrame(columns=["material", "offcut_length", "precut_mm", "batch_id", "timestamp"])
             st.info("ℹ️ No offcut inventory uploaded. Optimizing with fresh stock only.")
 
-        out, check_main, check_saw13, main_excel_buf, saw13_excel_buf, new_mem_df = optimize_with_memory(df_input, offcut_to_use, precut_mm)
+        out, check_main, check_tigerstop, check_saw13, main_excel_buf, tigerstop_excel_buf, saw13_excel_buf, new_mem_df = optimize_with_memory(df_input, offcut_to_use, precut_mm)
 
         # Create machine-readable file ONLY for main saw (exclude Saw #13 materials)
         try:
-            out_main_for_machine = out.loc[~out["material"].apply(is_saw13_material)].copy()
+            out_main_for_machine = out.loc[~(out["material"].apply(is_saw13_material) | out["material"].apply(is_tigerstop_material))].copy()
             machine_df = transform_optimized_to_machine_readable(out_main_for_machine)
             machine_buf = io.BytesIO()
             machine_df.to_csv(machine_buf, index=False, header=False, encoding="utf-8")
@@ -717,8 +774,10 @@ if uploaded is not None:
         # Store results in session state
         st.session_state.results = {
             'main_excel_buf': main_excel_buf,
+            'tigerstop_excel_buf': tigerstop_excel_buf,
             'saw13_excel_buf': saw13_excel_buf,
             'check_main': check_main,
+            'check_tigerstop': check_tigerstop,
             'check_saw13': check_saw13,
             'new_mem_df': new_mem_df,
             'machine_buf': machine_buf,
@@ -733,6 +792,13 @@ if uploaded is not None:
             label="⬇️ Main saw Excel (.xlsx)",
             data=st.session_state.results['main_excel_buf'],
             file_name="main saw.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+        st.download_button(
+            label="⬇️ Tiger Stop Saw Excel (.xlsx)",
+            data=st.session_state.results['tigerstop_excel_buf'],
+            file_name="Tiger Stop Saw.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
