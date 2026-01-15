@@ -9,6 +9,53 @@ STOCK = 4800.0
 MIN_REUSE = 330.0            # strictly > 330 mm is reusable
 MEMORY_FILE = "offcut_memory.csv"  # local CSV for persistent offcuts
 APP_TITLE = "🪚 Cut Batch Optimizer (with Offcut Memory)"
+
+# Materials to ignore completely (do not optimize, do not output). Exact match after trim.
+EXCLUDED_MATERIALS = {
+    "WB1183 (S-135-OW)",
+    "CV-03 MDF",
+}
+
+# Materials that must be exported to a separate file and optimized last.
+# Matching policy:
+# 1) exact match to full material string (after trim)
+# 2) else match by prefix (segment before first '.')
+SAW13_MATERIAL_CODES = {
+    "5760.05.00.4880",
+    "5762.05.00.4880",
+    "5901.05.00.4880",
+    "5903.05.00.4880",
+    "5915.05.00.4880",
+    "5919.05.33.4880",
+    "5956.05.00.4880",
+    "5969.05.00.4880",
+    "1749.05.00.4880",
+    "1769.05.33.4880",
+    "4760.05.00.4880",
+    "4762.05.00.4880",
+}
+SAW13_PREFIXES = {c.split(".")[0].lstrip("0") for c in SAW13_MATERIAL_CODES}
+
+
+def is_saw13_material(material_value) -> bool:
+    if material_value is None or (isinstance(material_value, float) and pd.isna(material_value)):
+        return False
+    s = str(material_value).strip()
+    if not s:
+        return False
+
+    if s in SAW13_MATERIAL_CODES:
+        return True
+
+    prefix = s.split(".")[0].strip().lstrip("0")
+    return prefix in SAW13_PREFIXES
+
+
+def is_excluded_material(material_value) -> bool:
+    if material_value is None or (isinstance(material_value, float) and pd.isna(material_value)):
+        return False
+    s = str(material_value).strip()
+    return s in EXCLUDED_MATERIALS
 # ---------------------------------------
 
 st.set_page_config(page_title="Cut Batch Optimizer", page_icon="🪚", layout="centered")
@@ -435,19 +482,80 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
     if "material" not in df.columns:
         df["material"] = "MATERIAL_1"
     df["material"] = df["material"].fillna("MATERIAL_1")
+
+    # Remove excluded materials entirely (do not output, do not optimize).
+    df = df.loc[~df["material"].apply(is_excluded_material)].copy()
+
     df["length"] = pd.to_numeric(df["length"], errors="coerce")
     valid = df[df["length"].notna()].copy()
 
     # Normalize offcut memory/inventory input
     offcut_mem_df = _normalize_offcut_inventory(offcut_mem_df, precut_default=precut_mm)
 
-    # Build material order (only materials in this batch)
+    # If nothing remains after filtering, return empty outputs but keep offcut carryover logic.
+    if valid.empty:
+        # Create empty optimization assignment frame so merge adds expected columns.
+        opt = pd.DataFrame(columns=[
+            "orig_index",
+            "material",
+            "source_length_mm",
+            "group_wastage_mm",
+            "carryover_offcut_mm",
+            "optimized_group",
+        ])
+
+        out = df.merge(opt, on=["orig_index", "material"], how="left")
+        out = out.sort_values(["optimized_group", "orig_index"], na_position="last").reset_index(drop=True)
+
+        export_cols_to_drop = {"orig_index", "group"}
+        unnamed_cols = {c for c in out.columns if str(c).strip().lower().startswith("unnamed")}
+        out_export = out.drop(columns=[c for c in out.columns if c in export_cols_to_drop or c in unnamed_cols], errors="ignore")
+
+        check_main = pd.DataFrame(columns=["optimized_group", "capacity", "sum_lengths", "material", "materials", "ok_capacity", "ok_single_material"])
+        check_saw13 = check_main.copy()
+
+        offcut_mem_df = _normalize_offcut_inventory(offcut_mem_df, precut_default=precut_mm)
+        batch_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+        timestamp = datetime.now().isoformat(timespec="seconds")
+
+        new_mem_records = []
+        if not offcut_mem_df.empty:
+            carry = offcut_mem_df.loc[offcut_mem_df["offcut_length"] > MIN_REUSE].copy()
+            for _, r in carry.iterrows():
+                new_mem_records.append({
+                    "material": r["material"],
+                    "offcut_length": float(r["offcut_length"]),
+                    "precut_mm": float(r.get("precut_mm", precut_mm)),
+                    "batch_id": batch_id,
+                    "timestamp": timestamp,
+                })
+        new_mem_df = pd.DataFrame(new_mem_records, columns=["material", "offcut_length", "precut_mm", "batch_id", "timestamp"])
+
+        main_excel_buf = io.BytesIO()
+        with pd.ExcelWriter(main_excel_buf, engine="openpyxl") as writer:
+            out_export.to_excel(writer, sheet_name="main saw", index=False)
+            check_main.to_excel(writer, sheet_name="Checks", index=False)
+        main_excel_buf.seek(0)
+
+        saw13_excel_buf = io.BytesIO()
+        with pd.ExcelWriter(saw13_excel_buf, engine="openpyxl") as writer:
+            out_export.iloc[0:0].to_excel(writer, sheet_name="saw #13", index=False)
+            check_saw13.to_excel(writer, sheet_name="Checks", index=False)
+        saw13_excel_buf.seek(0)
+
+        return out, check_main, check_saw13, main_excel_buf, saw13_excel_buf, new_mem_df
+
+    # Build material order (only materials in this batch).
+    # IMPORTANT: optimize Saw #13 materials last to avoid interleaving groups.
     materials = list(valid["material"].astype(str).drop_duplicates())
+    materials_main = [m for m in materials if not is_saw13_material(m)]
+    materials_saw13 = [m for m in materials if is_saw13_material(m)]
+    materials_ordered = materials_main + materials_saw13
 
     # Build a dict of offcut pools per material from memory
-    mem_pools = {m: [] for m in materials}
+    mem_pools = {m: [] for m in materials_ordered}
     if not offcut_mem_df.empty:
-        for m in materials:
+        for m in materials_ordered:
             pool = offcut_mem_df.loc[offcut_mem_df["material"].astype(str) == str(m), "offcut_length"].tolist()
             # (precut policy: we are *storing* precut, not subtracting from capacity now)
             mem_pools[m] = pool
@@ -455,21 +563,25 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
     # Optimize per material using its pool
     parts = []
     updated_pools = {}
-    for m in materials:
+    next_global_group = 1
+    for m in materials_ordered:
         sub = valid[valid["material"] == m]
         assign_m, pool_after = optimize_one_material(sub, mem_pools.get(m, []))
         assign_m["material"] = m
+
+        # Assign global group numbers sequentially in the chosen optimization order.
+        # This keeps all Saw #13 groups at the end.
+        if not assign_m.empty and "mat_group" in assign_m.columns:
+            n_groups = int(assign_m["mat_group"].max())
+            assign_m["optimized_group"] = assign_m["mat_group"].astype(int) + (next_global_group - 1)
+            next_global_group += n_groups
+
         parts.append(assign_m)
         updated_pools[m] = pool_after
 
     opt = pd.concat(parts, ignore_index=True)
-
-    # Global group numbering: by material then material-group
-    opt = opt.sort_values(["material", "mat_group"]).reset_index(drop=True)
-    unique_pairs = opt[["material", "mat_group"]].drop_duplicates().reset_index(drop=True)
-    pair_to_global = {(row.material, row.mat_group): i + 1 for i, row in unique_pairs.iterrows()}
-    opt["optimized_group"] = opt.apply(lambda r: pair_to_global[(r["material"], r["mat_group"])], axis=1)
-    opt = opt.drop(columns=["mat_group"])
+    if "mat_group" in opt.columns:
+        opt = opt.drop(columns=["mat_group"])
 
     # Merge back, keep original fields intact
     out = df.merge(opt, on=["orig_index", "material"], how="left")
@@ -480,18 +592,23 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
     unnamed_cols = {c for c in out.columns if str(c).strip().lower().startswith("unnamed")}
     out_export = out.drop(columns=[c for c in out.columns if c in export_cols_to_drop or c in unnamed_cols], errors="ignore")
 
-    # Build checks
-    check = (
+    # Build checks (split: main vs Saw #13) to avoid confusion
+    check_all = (
         out.groupby("optimized_group")
         .agg(
             capacity=("source_length_mm", "first"),
             sum_lengths=("length", "sum"),
+            material=("material", "first"),
             materials=("material", lambda s: ",".join(sorted(set(str(x) for x in s if pd.notna(x))))),
         )
         .reset_index()
     )
-    check["ok_capacity"] = check["sum_lengths"] <= check["capacity"] + 1e-9
-    check["ok_single_material"] = ~check["materials"].str.contains(",")
+    check_all["ok_capacity"] = check_all["sum_lengths"] <= check_all["capacity"] + 1e-9
+    check_all["ok_single_material"] = ~check_all["materials"].str.contains(",")
+    check_all["is_saw13"] = check_all["material"].apply(is_saw13_material)
+
+    check_main = check_all.loc[~check_all["is_saw13"]].drop(columns=["is_saw13"]).reset_index(drop=True)
+    check_saw13 = check_all.loc[check_all["is_saw13"]].drop(columns=["is_saw13"]).reset_index(drop=True)
 
     # --- Update offcut memory for NEXT batches ---
     # IMPORTANT: Offcuts for materials NOT in this batch must still carry forward.
@@ -502,7 +619,7 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
 
     # 1) Carry forward uploaded offcuts for materials not present in this cut batch
     if not offcut_mem_df.empty:
-        carryover_other = offcut_mem_df.loc[~offcut_mem_df["material"].isin(materials)].copy()
+        carryover_other = offcut_mem_df.loc[~offcut_mem_df["material"].isin(materials_ordered)].copy()
         carryover_other = carryover_other[carryover_other["offcut_length"] > MIN_REUSE]
         for _, r in carryover_other.iterrows():
             new_mem_records.append({
@@ -528,14 +645,24 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
     # 2) Create DataFrame (no longer saving to file for cloud hosting)
     new_mem_df = pd.DataFrame(new_mem_records, columns=["material", "offcut_length", "precut_mm", "batch_id", "timestamp"])
 
-    # 3) Create downloadable buffers
-    excel_buf = io.BytesIO()
-    with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-        out_export.to_excel(writer, sheet_name="Optimized", index=False)
-        check.to_excel(writer, sheet_name="Checks", index=False)
-    excel_buf.seek(0)
+    # 3) Split export into 2 separate files
+    saw13_mask = out_export["material"].apply(is_saw13_material)
+    out_export_main = out_export.loc[~saw13_mask].reset_index(drop=True)
+    out_export_saw13 = out_export.loc[saw13_mask].reset_index(drop=True)
 
-    return out, check, excel_buf, new_mem_df
+    main_excel_buf = io.BytesIO()
+    with pd.ExcelWriter(main_excel_buf, engine="openpyxl") as writer:
+        out_export_main.to_excel(writer, sheet_name="main saw", index=False)
+        check_main.to_excel(writer, sheet_name="Checks", index=False)
+    main_excel_buf.seek(0)
+
+    saw13_excel_buf = io.BytesIO()
+    with pd.ExcelWriter(saw13_excel_buf, engine="openpyxl") as writer:
+        out_export_saw13.to_excel(writer, sheet_name="saw #13", index=False)
+        check_saw13.to_excel(writer, sheet_name="Checks", index=False)
+    saw13_excel_buf.seek(0)
+
+    return out, check_main, check_saw13, main_excel_buf, saw13_excel_buf, new_mem_df
 
 # ---------- Run when file uploaded ----------
 if uploaded is not None:
@@ -562,11 +689,12 @@ if uploaded is not None:
             offcut_to_use = pd.DataFrame(columns=["material", "offcut_length", "precut_mm", "batch_id", "timestamp"])
             st.info("ℹ️ No offcut inventory uploaded. Optimizing with fresh stock only.")
 
-        out, check, excel_buf, new_mem_df = optimize_with_memory(df_input, offcut_to_use, precut_mm)
+        out, check_main, check_saw13, main_excel_buf, saw13_excel_buf, new_mem_df = optimize_with_memory(df_input, offcut_to_use, precut_mm)
 
-        # Create machine-readable file from OPTIMIZED output
+        # Create machine-readable file ONLY for main saw (exclude Saw #13 materials)
         try:
-            machine_df = transform_optimized_to_machine_readable(out)
+            out_main_for_machine = out.loc[~out["material"].apply(is_saw13_material)].copy()
+            machine_df = transform_optimized_to_machine_readable(out_main_for_machine)
             machine_buf = io.BytesIO()
             machine_df.to_csv(machine_buf, index=False, header=False, encoding="utf-8")
             machine_buf.seek(0)
@@ -588,7 +716,10 @@ if uploaded is not None:
 
         # Store results in session state
         st.session_state.results = {
-            'excel_buf': excel_buf,
+            'main_excel_buf': main_excel_buf,
+            'saw13_excel_buf': saw13_excel_buf,
+            'check_main': check_main,
+            'check_saw13': check_saw13,
             'new_mem_df': new_mem_df,
             'machine_buf': machine_buf,
             'barcode_buf': barcode_buf,
@@ -599,9 +730,16 @@ if uploaded is not None:
     if 'results' in st.session_state:
         st.subheader("📂 Downloads")
         st.download_button(
-            label="⬇️ Optimized Excel (.xlsx)",
-            data=st.session_state.results['excel_buf'],
-            file_name="optimized_cut_batch.xlsx",
+            label="⬇️ Main saw Excel (.xlsx)",
+            data=st.session_state.results['main_excel_buf'],
+            file_name="main saw.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+        st.download_button(
+            label="⬇️ Saw #13 Excel (.xlsx)",
+            data=st.session_state.results['saw13_excel_buf'],
+            file_name="saw #13.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
