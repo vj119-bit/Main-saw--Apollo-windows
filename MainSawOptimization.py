@@ -16,6 +16,21 @@ EXCLUDED_MATERIALS = {
     "CV-03 MDF",
 }
 
+# Main Saw machine materials (exact match)
+MAIN_SAW_MATERIAL_CODES = {
+    "1749.05.33.4880",
+    "1769.05.33.4880",
+    "3216.05.33.4880",
+    "3223.05.33.4880",
+    "3712.05.33.4880",
+    "3715.05.33.4880",
+    "3832.05.33.4880",
+    "3845.05.33.4880",
+    "3952.05.33.4880",
+    "3955.05.33.4880",
+    "4710.05.00.4880",
+}
+
 # Materials that must be exported to a separate file and optimized last.
 # Matching policy:
 # - exact match to full material string (after trim)
@@ -26,8 +41,6 @@ SAW13_MATERIAL_CODES = {
     "5919.05.33.4880",
     "5956.05.00.4880",
     "5969.05.00.4880",
-    "1749.05.00.4880",
-    "1769.05.33.4880",
     "4760.05.00.4880",
     "4762.05.00.4880",
 }
@@ -89,11 +102,27 @@ def is_tigerstop_material(material_value) -> bool:
     return s in TIGERSTOP_MATERIAL_CODES
 
 
+def is_main_saw_material(material_value) -> bool:
+    if material_value is None or (isinstance(material_value, float) and pd.isna(material_value)):
+        return False
+    s = str(material_value).strip()
+    if not s:
+        return False
+    return s in MAIN_SAW_MATERIAL_CODES
+
+
 def is_excluded_material(material_value) -> bool:
     if material_value is None or (isinstance(material_value, float) and pd.isna(material_value)):
         return False
     s = str(material_value).strip()
     return s in EXCLUDED_MATERIALS
+
+
+def is_recognized_material(material_value) -> bool:
+    """Return True if the material belongs to any known machine list."""
+    return (is_main_saw_material(material_value)
+            or is_saw13_material(material_value)
+            or is_tigerstop_material(material_value))
 # ---------------------------------------
 
 st.set_page_config(page_title="Cut Batch Optimizer", page_icon="🪚", layout="centered")
@@ -524,6 +553,9 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
     # Remove excluded materials entirely (do not output, do not optimize).
     df = df.loc[~df["material"].apply(is_excluded_material)].copy()
 
+    # Also remove materials not in any recognized machine list.
+    df = df.loc[df["material"].apply(is_recognized_material)].copy()
+
     df["length"] = pd.to_numeric(df["length"], errors="coerce")
     valid = df[df["length"].notna()].copy()
 
@@ -593,7 +625,7 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
     # Build material order (only materials in this batch).
     # IMPORTANT: optimize special machines at the end to avoid interleaving groups.
     materials = list(valid["material"].astype(str).drop_duplicates())
-    materials_main = [m for m in materials if (not is_saw13_material(m)) and (not is_tigerstop_material(m))]
+    materials_main = [m for m in materials if is_main_saw_material(m)]
     materials_tigerstop = [m for m in materials if is_tigerstop_material(m)]
     materials_saw13 = [m for m in materials if is_saw13_material(m)]
     # Keep Saw #13 last (as requested earlier), TigerStop just before it.
@@ -655,9 +687,11 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
     check_all["is_saw13"] = check_all["material"].apply(is_saw13_material)
     check_all["is_tigerstop"] = check_all["material"].apply(is_tigerstop_material)
 
-    check_main = check_all.loc[~(check_all["is_saw13"] | check_all["is_tigerstop"])].drop(columns=["is_saw13", "is_tigerstop"]).reset_index(drop=True)
-    check_tigerstop = check_all.loc[check_all["is_tigerstop"]].drop(columns=["is_saw13", "is_tigerstop"]).reset_index(drop=True)
-    check_saw13 = check_all.loc[check_all["is_saw13"]].drop(columns=["is_saw13", "is_tigerstop"]).reset_index(drop=True)
+    check_all["is_main_saw"] = check_all["material"].apply(is_main_saw_material)
+
+    check_main = check_all.loc[check_all["is_main_saw"]].drop(columns=["is_saw13", "is_tigerstop", "is_main_saw"]).reset_index(drop=True)
+    check_tigerstop = check_all.loc[check_all["is_tigerstop"]].drop(columns=["is_saw13", "is_tigerstop", "is_main_saw"]).reset_index(drop=True)
+    check_saw13 = check_all.loc[check_all["is_saw13"]].drop(columns=["is_saw13", "is_tigerstop", "is_main_saw"]).reset_index(drop=True)
 
     # --- Update offcut memory for NEXT batches ---
     # IMPORTANT: Offcuts for materials NOT in this batch must still carry forward.
@@ -695,9 +729,10 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
     new_mem_df = pd.DataFrame(new_mem_records, columns=["material", "offcut_length", "precut_mm", "batch_id", "timestamp"])
 
     # 3) Split export into 3 separate files
+    main_mask = out_export["material"].apply(is_main_saw_material)
     saw13_mask = out_export["material"].apply(is_saw13_material)
     tiger_mask = out_export["material"].apply(is_tigerstop_material)
-    out_export_main = out_export.loc[~(saw13_mask | tiger_mask)].reset_index(drop=True)
+    out_export_main = out_export.loc[main_mask].reset_index(drop=True)
     out_export_tigerstop = out_export.loc[tiger_mask].reset_index(drop=True)
     out_export_saw13 = out_export.loc[saw13_mask].reset_index(drop=True)
 
@@ -750,7 +785,7 @@ if uploaded is not None:
 
         # Create machine-readable file ONLY for main saw (exclude Saw #13 materials)
         try:
-            out_main_for_machine = out.loc[~(out["material"].apply(is_saw13_material) | out["material"].apply(is_tigerstop_material))].copy()
+            out_main_for_machine = out.loc[out["material"].apply(is_main_saw_material)].copy()
             machine_df = transform_optimized_to_machine_readable(out_main_for_machine)
             machine_buf = io.BytesIO()
             machine_df.to_csv(machine_buf, index=False, header=False, encoding="utf-8")
