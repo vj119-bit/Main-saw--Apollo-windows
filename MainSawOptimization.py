@@ -378,6 +378,58 @@ def reorder_barcode_pdf_to_optimized(pdf_bytes: bytes, optimized_out: pd.DataFra
 
     return out_buf, report
 
+def split_barcode_pdf_by_machine(pdf_bytes: bytes) -> dict[str, io.BytesIO]:
+    """Split barcode PDF pages into 3 PDFs based on material code on each label.
+
+    Reads PXX... token from each page, takes the digits (e.g. P5760 -> 5760),
+    and matches against the first 4 digits of each machine's material list.
+    Returns dict with keys 'main_saw', 'saw13', 'tigerstop' -> BytesIO PDFs.
+    Pages that don't match any list are skipped.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except Exception as e:
+        raise RuntimeError("Missing pymupdf for PDF splitting.") from e
+
+    import re
+
+    # Build prefix lookup: first 4 digits of each material code -> machine name
+    prefix_to_machine: dict[str, str] = {}
+    for code in MAIN_SAW_MATERIAL_CODES:
+        prefix_to_machine[code.split(".")[0].strip()] = "main_saw"
+    for code in SAW13_MATERIAL_CODES:
+        prefix_to_machine[code.split(".")[0].strip()] = "saw13"
+    for code in TIGERSTOP_MATERIAL_CODES:
+        prefix_to_machine[code.split(".")[0].strip()] = "tigerstop"
+
+    src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pattern = re.compile(r"\bP(\d{2,})[A-Za-z0-9]*\b")
+
+    buckets: dict[str, list[int]] = {"main_saw": [], "saw13": [], "tigerstop": []}
+
+    for i in range(src_doc.page_count):
+        text = (src_doc.load_page(i).get_text("text") or "")
+        m = pattern.search(text)
+        if not m:
+            continue
+        code = m.group(1)  # e.g. "5760"
+        machine = prefix_to_machine.get(code)
+        if machine:
+            buckets[machine].append(i)
+
+    result: dict[str, io.BytesIO] = {}
+    for key in ("main_saw", "saw13", "tigerstop"):
+        if buckets[key]:
+            new_doc = fitz.open()
+            for page_idx in buckets[key]:
+                new_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
+            buf = io.BytesIO(new_doc.tobytes())
+            buf.seek(0)
+            result[key] = buf
+
+    return result
+
+
 # --------- Sidebar: Offcut Controls ---------
 st.sidebar.header("🧠 Offcut Settings")
 
@@ -806,6 +858,15 @@ if uploaded is not None:
                 barcode_report = None
                 st.warning(f"⚠️ Could not reorder barcode PDF: {e}")
 
+        # Split barcode PDF by machine (independent of reorder)
+        split_barcode_pdfs = {}
+        if barcode_pdf is not None:
+            try:
+                pdf_bytes = barcode_pdf.getvalue()
+                split_barcode_pdfs = split_barcode_pdf_by_machine(pdf_bytes)
+            except Exception as e:
+                st.warning(f"⚠️ Could not split barcode PDF by machine: {e}")
+
         # Store results in session state
         st.session_state.results = {
             'main_excel_buf': main_excel_buf,
@@ -818,6 +879,9 @@ if uploaded is not None:
             'machine_buf': machine_buf,
             'barcode_buf': barcode_buf,
             'barcode_report': barcode_report,
+            'split_barcode_main': split_barcode_pdfs.get('main_saw'),
+            'split_barcode_saw13': split_barcode_pdfs.get('saw13'),
+            'split_barcode_tigerstop': split_barcode_pdfs.get('tigerstop'),
         }
     
     # Display downloads if results exist in session state
@@ -852,16 +916,32 @@ if uploaded is not None:
                 mime="text/csv",
             )
 
-        if st.session_state.results.get('barcode_buf') is not None:
+        # Split barcode PDF downloads
+        if st.session_state.results.get('split_barcode_main') is not None:
             st.download_button(
-                label="⬇️ Reordered barcode PDF",
-                data=st.session_state.results['barcode_buf'],
-                file_name="barcodes_reordered.pdf",
+                label="⬇️ Barcode labels - Main Saw",
+                data=st.session_state.results['split_barcode_main'],
+                file_name="barcodes_main_saw.pdf",
                 mime="application/pdf",
             )
-            if st.session_state.results.get('barcode_report') is not None:
-                st.caption("Barcode reorder summary")
-                st.dataframe(st.session_state.results['barcode_report'], use_container_width=True)
+        if st.session_state.results.get('split_barcode_saw13') is not None:
+            st.download_button(
+                label="⬇️ Barcode labels - Saw #13",
+                data=st.session_state.results['split_barcode_saw13'],
+                file_name="barcodes_saw13.pdf",
+                mime="application/pdf",
+            )
+        if st.session_state.results.get('split_barcode_tigerstop') is not None:
+            st.download_button(
+                label="⬇️ Barcode labels - Tiger Stop",
+                data=st.session_state.results['split_barcode_tigerstop'],
+                file_name="barcodes_tigerstop.pdf",
+                mime="application/pdf",
+            )
+
+        if st.session_state.results.get('barcode_report') is not None:
+            st.caption("Barcode reorder summary")
+            st.dataframe(st.session_state.results['barcode_report'], use_container_width=True)
         
         # Download button for generated offcuts
         if not st.session_state.results['new_mem_df'].empty:
