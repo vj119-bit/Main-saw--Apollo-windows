@@ -800,6 +800,12 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
         check_tigerstop.to_excel(writer, sheet_name="Checks", index=False)
     tigerstop_excel_buf.seek(0)
 
+    # For material 5956.05.00.4880 only, force qty to 1 in Saw #13 sheet
+    _qty_col_saw13 = next((c for c in out_export_saw13.columns if str(c).strip().lower() in ("qty", "quantity")), None)
+    if _qty_col_saw13 is not None:
+        _mask_5956 = out_export_saw13["material"].astype(str).str.strip() == "5956.05.00.4880"
+        out_export_saw13.loc[_mask_5956, _qty_col_saw13] = 1
+
     saw13_excel_buf = io.BytesIO()
     with pd.ExcelWriter(saw13_excel_buf, engine="openpyxl") as writer:
         out_export_saw13.to_excel(writer, sheet_name="saw #13", index=False)
