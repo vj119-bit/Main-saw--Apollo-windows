@@ -14,11 +14,15 @@ APP_TITLE = "🪚 Cut Batch Optimizer (with Offcut Memory)"
 EXCLUDED_MATERIALS = {
     "WB1183 (S-135-OW)",
     "CV-03 MDF",
+    "190772-White",
+    "9704.58.CFBAL",
+    "CV0430-07-16",
+    "WB1112 (S-126 OW)",
 }
 
 # Main Saw machine materials (exact match)
 MAIN_SAW_MATERIAL_CODES = {
-    "1749.05.33.4880",
+    "1749.05.00.4880",
     "1769.05.33.4880",
     "3216.05.33.4880",
     "3223.05.33.4880",
@@ -51,7 +55,10 @@ TIGERSTOP_MATERIAL_CODES = {
     "5825.05.00.4880",
     "5772.05.00.4880",
     "5872.05.00.4880",
+    "1800.05.00.4880",
+    "5771.05.00.4880",
     "5890.05.00.4880",
+    "5800.05.00.4880",
     "5826.05.00.4880",
     "5881.05.00.4880",
     "5828.05.00.4880",
@@ -94,12 +101,19 @@ def is_saw13_material(material_value) -> bool:
 
 
 def is_tigerstop_material(material_value) -> bool:
+    """Tiger Stop is the catch-all: anything not Main Saw, not Saw #13, and not Excluded."""
     if material_value is None or (isinstance(material_value, float) and pd.isna(material_value)):
         return False
     s = str(material_value).strip()
     if not s:
         return False
-    return s in TIGERSTOP_MATERIAL_CODES
+    if s in EXCLUDED_MATERIALS:
+        return False
+    if s in MAIN_SAW_MATERIAL_CODES:
+        return False
+    if s in SAW13_MATERIAL_CODES:
+        return False
+    return True
 
 
 def is_main_saw_material(material_value) -> bool:
@@ -119,10 +133,10 @@ def is_excluded_material(material_value) -> bool:
 
 
 def is_recognized_material(material_value) -> bool:
-    """Return True if the material belongs to any known machine list."""
-    return (is_main_saw_material(material_value)
-            or is_saw13_material(material_value)
-            or is_tigerstop_material(material_value))
+    """Return True if the material is not excluded (Tiger Stop catches everything else)."""
+    if is_excluded_material(material_value):
+        return False
+    return True
 # ---------------------------------------
 
 st.set_page_config(page_title="Cut Batch Optimizer", page_icon="🪚", layout="centered")
