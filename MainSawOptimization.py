@@ -275,10 +275,10 @@ def _extract_material_prefix(material_value) -> str:
 def reorder_barcode_pdf_to_optimized(pdf_bytes: bytes, optimized_out: pd.DataFrame) -> tuple[io.BytesIO, pd.DataFrame]:
     """Reorder barcode PDF pages to match optimized cut order.
 
-    Assumptions based on your description:
-    - Original barcode PDF pages are in the SAME sequence as the original cut-batch rows.
-    - We align pages to original rows by matching material prefix (e.g., 3223) to barcode text token like P3223....
-    - If a PDF page doesn't contain a material code (no P####), it is skipped during alignment.
+    - Groups PDF pages by material code prefix (e.g. P3223... -> "3223").
+    - For each row in original order, pops the first available page with a matching prefix.
+    - This is robust to interleaved materials (main saw / tigerstop / saw13) — no fragile
+      single-pointer scan that breaks on mismatches.
     - Final output is reordered to match the optimized order (optimized_group, then orig_index).
     """
 
@@ -290,6 +290,7 @@ def reorder_barcode_pdf_to_optimized(pdf_bytes: bytes, optimized_out: pd.DataFra
         ) from e
 
     import re
+    from collections import defaultdict
 
     src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages = []
@@ -313,11 +314,21 @@ def reorder_barcode_pdf_to_optimized(pdf_bytes: bytes, optimized_out: pd.DataFra
     original_order = optimized_out.sort_values(["orig_index"]).reset_index(drop=True)
     original_order["_mat_prefix"] = original_order["material"].apply(_extract_material_prefix)
 
-    # Align pages to original rows sequentially
-    row_to_page: dict[int, int] = {}
+    # Build per-prefix buckets of page indices (in order of appearance in the PDF).
+    # This avoids the fragile single-pointer sequential scan: with multiple interleaved
+    # materials the old scan would advance p past pages belonging to later rows whenever
+    # a prefix mismatch occurred, permanently losing those pages.
+    code_to_pages: dict[str, list[int]] = defaultdict(list)
     skipped_pages: list[int] = []
+    for pg in pages:
+        if pg["code"] is not None:
+            code_to_pages[pg["code"]].append(pg["page_index"])
+        else:
+            skipped_pages.append(pg["page_index"])
+
+    # Align: for each row (in original order), pop the first page whose prefix matches.
+    row_to_page: dict[int, int] = {}
     used_pages: set[int] = set()
-    p = 0
     for _, row in original_order.iterrows():
         oid = int(row["orig_index"]) if pd.notna(row["orig_index"]) else None
         if oid is None:
@@ -325,21 +336,11 @@ def reorder_barcode_pdf_to_optimized(pdf_bytes: bytes, optimized_out: pd.DataFra
         want = str(row.get("_mat_prefix", "") or "").strip()
         if not want:
             continue
-
-        # Find next matching page
-        while p < len(pages):
-            page = pages[p]
-            if page["code"] is None:
-                skipped_pages.append(page["page_index"])
-                p += 1
-                continue
-            if str(page["code"]) == want:
-                row_to_page[oid] = page["page_index"]
-                used_pages.add(page["page_index"])
-                p += 1
-                break
-            # mismatch: move forward
-            p += 1
+        avail = code_to_pages.get(want, [])
+        if avail:
+            page_idx = avail.pop(0)
+            row_to_page[oid] = page_idx
+            used_pages.add(page_idx)
 
     # Build reorder list in optimized order
     optimized_order = optimized_out.sort_values(["optimized_group", "orig_index"]).reset_index(drop=True)
@@ -878,12 +879,13 @@ if uploaded is not None:
                 barcode_report = None
                 st.warning(f"⚠️ Could not reorder barcode PDF: {e}")
 
-        # Split barcode PDF by machine (independent of reorder)
+        # Split barcode PDF by machine — use reordered PDF so per-machine PDFs
+        # are already in optimized order. Fall back to original if reorder failed.
         split_barcode_pdfs = {}
         if barcode_pdf is not None:
             try:
-                pdf_bytes = barcode_pdf.getvalue()
-                split_barcode_pdfs = split_barcode_pdf_by_machine(pdf_bytes)
+                split_source = barcode_buf.getvalue() if barcode_buf is not None else barcode_pdf.getvalue()
+                split_barcode_pdfs = split_barcode_pdf_by_machine(split_source)
             except Exception as e:
                 st.warning(f"⚠️ Could not split barcode PDF by machine: {e}")
 
