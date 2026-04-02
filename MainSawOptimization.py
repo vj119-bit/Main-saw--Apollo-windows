@@ -158,7 +158,7 @@ def transform_optimized_to_machine_readable(optimized_df: pd.DataFrame) -> pd.Da
     df = optimized_df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     # Trim string cells
-    df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+    df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
 
     def _round_half_up_whole_number(value, default: str = "0") -> str:
         """Round to nearest whole number using HALF-UP.
