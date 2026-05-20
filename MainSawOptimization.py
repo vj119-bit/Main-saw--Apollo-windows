@@ -41,6 +41,7 @@ MAIN_SAW_MATERIAL_CODES = {
     "9641 - VYJE - 450",
     "9640 - VYJE - 362",
     "3952.05.00.4880",
+    "5856.05.00.4880",
 }
 
 # Materials that must be exported to a separate file and optimized last.
