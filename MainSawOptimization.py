@@ -20,6 +20,7 @@ EXCLUDED_MATERIALS = {
     "9704.58.CFBAL",
     "CV0430-07-16",
     "WB1112 (S-126 OW)",
+    "WB1093 (S-126 Black)",
 }
 
 # Main Saw machine materials (exact match)
