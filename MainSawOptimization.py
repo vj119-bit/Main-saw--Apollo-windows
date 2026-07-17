@@ -45,6 +45,7 @@ MAIN_SAW_MATERIAL_CODES = {
     "9640 - VYJE - 362",
     "3952.05.00.4880",
     "5856.05.00.4880",
+    "R8570FS-836",
 }
 
 # Materials that must be exported to a separate file and optimized last.
@@ -76,6 +77,8 @@ SAW13_MATERIAL_CODES = {
     "927827S (9964)",
     "927827W (9964)",
     "99301-NF",
+    "R6904FS-836",
+    "R8572FS-836",
 }
 
 # Tiger Stop Saw machine materials (exact match)
