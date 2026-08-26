@@ -564,12 +564,22 @@ def transform_optimized_to_machine_readable(optimized_df: pd.DataFrame) -> pd.Da
 
 
 def _extract_material_prefix(material_value) -> str:
+    """Return only the leading digits of the material code (e.g. '3223L' -> '3223').
+
+    Barcode PDF labels (PXXXXW...) only ever encode the numeric portion of the
+    material code, so any trailing letter suffix (L/R/etc.) must be stripped
+    here too, otherwise prefixes like '3223L' will never match the PDF's '3223'.
+    """
     if material_value is None or (isinstance(material_value, float) and pd.isna(material_value)):
         return ""
     s = str(material_value).strip()
     if not s:
         return ""
-    return s.split(".")[0].strip()
+    import re
+
+    token = s.split(".")[0].strip()
+    m = re.match(r"^(\d+)", token)
+    return m.group(1) if m else token
 
 
 def reorder_barcode_pdf_to_optimized(pdf_bytes: bytes, optimized_out: pd.DataFrame) -> tuple[io.BytesIO, pd.DataFrame]:
@@ -708,14 +718,15 @@ def split_barcode_pdf_by_machine(pdf_bytes: bytes) -> dict[str, io.BytesIO]:
 
     import re
 
-    # Build prefix lookup: first 4 digits of each material code -> machine name
+    # Build prefix lookup: leading digits of each material code -> machine name
+    # (matches barcode label's numeric-only prefix, e.g. '3223L.05...' -> '3223')
     prefix_to_machine: dict[str, str] = {}
     for code in MAIN_SAW_MATERIAL_CODES:
-        prefix_to_machine[code.split(".")[0].strip()] = "main_saw"
+        prefix_to_machine[_extract_material_prefix(code)] = "main_saw"
     for code in SAW13_MATERIAL_CODES:
-        prefix_to_machine[code.split(".")[0].strip()] = "saw13"
+        prefix_to_machine[_extract_material_prefix(code)] = "saw13"
     for code in TIGERSTOP_MATERIAL_CODES:
-        prefix_to_machine[code.split(".")[0].strip()] = "tigerstop"
+        prefix_to_machine[_extract_material_prefix(code)] = "tigerstop"
 
     src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pattern = re.compile(r"\bP(\d{2,})[A-Za-z0-9]*\b")
