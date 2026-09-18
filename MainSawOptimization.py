@@ -9,6 +9,8 @@ from datetime import datetime
 # ---------------- Config ----------------
 STOCK = 4800.0
 MIN_REUSE = 330.0            # strictly > 330 mm is reusable
+MAIN_SAW_END_WASTE = 300.0   # unusable at the end of every Main Saw bar/offcut
+MAIN_SAW_CUT_WASTE = 14.0    # consumed before every Main Saw cut
 MEMORY_FILE = "offcut_memory.csv"  # local CSV for persistent offcuts
 APP_TITLE = "🪚 Cut Batch Optimizer (with Offcut Memory)"
 
@@ -790,7 +792,13 @@ uploaded = st.file_uploader("Upload your cut batch file (.xls, .xlsx, .csv)", ty
 # Barcode PDF upload (for reordering to match optimized output)
 barcode_pdf = st.file_uploader("Upload barcode PDF (optional)", type=["pdf"])
 
-def optimize_one_material(subdf: pd.DataFrame, mem_pool: list[float], length_col: str = "length") -> tuple[pd.DataFrame, list[float]]:
+def optimize_one_material(
+    subdf: pd.DataFrame,
+    mem_pool: list[float],
+    length_col: str = "length",
+    end_waste: float = 0.0,
+    cut_waste: float = 0.0,
+) -> tuple[pd.DataFrame, list[float]]:
     """
     subdf: rows of one material (with columns: orig_index, length, material)
     mem_pool: list of offcut lengths (>330) for THIS material (already precut-adjusted if needed)
@@ -811,40 +819,47 @@ def optimize_one_material(subdf: pd.DataFrame, mem_pool: list[float], length_col
         .tolist()
     )
 
-    # work on a local copy of pool
-    offcuts = sorted([oc for oc in mem_pool if oc > MIN_REUSE], reverse=True)
+    # Stored offcuts are physical lengths. Remove the machine's end waste before use.
+    offcuts = sorted(
+        [(oc, oc - end_waste) for oc in mem_pool if oc - end_waste > MIN_REUSE],
+        key=lambda item: item[1],
+        reverse=True,
+    )
     groups = []
     mgroup = 1
 
     while items:
         largest_len = max(L for _, L in items)
         # choose the largest offcut that can fit the largest remaining item
-        usable = [oc for oc in offcuts if oc >= largest_len]
+        usable = [oc for oc in offcuts if oc[1] >= largest_len]
         if usable:
-            cap = usable[0]
-            offcuts.remove(cap)
+            source_length, cap = usable[0]
+            offcuts.remove(usable[0])
         else:
-            cap = STOCK
+            source_length = STOCK
+            cap = STOCK - end_waste
 
         total = 0.0
         placed_idx = []
         for i, (oid, L) in enumerate(items):
-            if total + L <= cap:
+            if total + L + cut_waste <= cap:
                 placed_idx.append(i)
-                total += L
+                total += L + cut_waste
 
         if not placed_idx:
             placed_idx = [0]
-            total = items[0][1]
+            total = items[0][1] + cut_waste
 
-        leftover = cap - total
-        if leftover > MIN_REUSE:
-            offcuts.append(leftover)
+        usable_leftover = cap - total
+        physical_leftover = usable_leftover + end_waste
+        if usable_leftover > MIN_REUSE:
+            offcuts.append((physical_leftover, usable_leftover))
 
         groups.append({
             "mat_group": mgroup,
+            "source_length": source_length,
             "capacity": cap,
-            "leftover": leftover,
+            "leftover": physical_leftover,
             "ids": [items[i][0] for i in placed_idx]
         })
 
@@ -859,13 +874,13 @@ def optimize_one_material(subdf: pd.DataFrame, mem_pool: list[float], length_col
             rows.append({
                 "orig_index": oid,
                 "mat_group": g["mat_group"],
-                "source_length_mm": g["capacity"],
+                "source_length_mm": g["source_length"],
                 "group_wastage_mm": round(g["leftover"], 3),
                 "carryover_offcut_mm": round(g["leftover"], 3) if g["leftover"] > MIN_REUSE else None
             })
 
     # return assignments + updated pool
-    return pd.DataFrame(rows), offcuts
+    return pd.DataFrame(rows), [physical_length for physical_length, _ in offcuts]
 
 
 def _normalize_offcut_inventory(offcut_df: pd.DataFrame | None, precut_default: float) -> pd.DataFrame:
@@ -938,7 +953,14 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
     valid = df[df["length"].notna()].copy()
 
     # Default optimization length for all machines uses row length.
-    valid["optimization_length"] = valid["length"]
+    # Keep planning length numeric/float so machine-specific allowances work with
+    # integer input files on current pandas versions.
+    valid["optimization_length"] = valid["length"].astype(float)
+
+    main_saw_mask_valid = valid["material"].apply(is_main_saw_material)
+    valid.loc[main_saw_mask_valid, "optimization_length"] = (
+        valid.loc[main_saw_mask_valid, "length"] + MAIN_SAW_CUT_WASTE
+    )
 
     # Saw #13 only: account qty in optimization so source length planning matches
     # one-piece-at-a-time cutting behavior.
@@ -1041,8 +1063,25 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
     next_global_group = 1
     for m in materials_ordered:
         sub = valid[valid["material"] == m]
-        length_col = "optimization_length" if is_saw13_material(m) else "length"
-        assign_m, pool_after = optimize_one_material(sub, mem_pools.get(m, []), length_col=length_col)
+        if is_saw13_material(m):
+            length_col = "optimization_length"
+            end_waste = 0.0
+            cut_waste = 0.0
+        elif is_main_saw_material(m):
+            length_col = "optimization_length"
+            end_waste = MAIN_SAW_END_WASTE
+            cut_waste = 0.0
+        else:
+            length_col = "length"
+            end_waste = 0.0
+            cut_waste = 0.0
+        assign_m, pool_after = optimize_one_material(
+            sub,
+            mem_pools.get(m, []),
+            length_col=length_col,
+            end_waste=end_waste,
+            cut_waste=cut_waste,
+        )
         assign_m["material"] = m
 
         # Assign global group numbers sequentially in the chosen optimization order.
@@ -1059,12 +1098,19 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
     if "mat_group" in opt.columns:
         opt = opt.drop(columns=["mat_group"])
 
+    # Keep the machine-specific planning length available for validation.
+    opt = opt.merge(
+        valid[["orig_index", "optimization_length"]],
+        on="orig_index",
+        how="left",
+    )
+
     # Merge back, keep original fields intact
     out = df.merge(opt, on=["orig_index", "material"], how="left")
     out = out.sort_values(["optimized_group", "orig_index"]).reset_index(drop=True)
 
     # Prepare export view (hide internal/helper/noise columns)
-    export_cols_to_drop = {"orig_index", "group"}
+    export_cols_to_drop = {"orig_index", "group", "optimization_length"}
     unnamed_cols = {c for c in out.columns if str(c).strip().lower().startswith("unnamed")}
     out_export = out.drop(columns=[c for c in out.columns if c in export_cols_to_drop or c in unnamed_cols], errors="ignore")
 
@@ -1073,7 +1119,7 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
         out.groupby("optimized_group")
         .agg(
             capacity=("source_length_mm", "first"),
-            sum_lengths=("length", "sum"),
+            sum_lengths=("optimization_length", "sum"),
             material=("material", "first"),
             materials=("material", lambda s: ",".join(sorted(set(str(x) for x in s if pd.notna(x))))),
         )
@@ -1164,10 +1210,13 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
         check_tigerstop.to_excel(writer, sheet_name="Checks", index=False)
     tigerstop_excel_buf.seek(0)
 
-    # For material 5956.05.00.4880 only, force qty to 1 in Saw #13 sheet
+    # For the 5956 Saw #13 materials, force qty to 1 in Saw #13 sheet
     _qty_col_saw13 = next((c for c in out_export_saw13.columns if str(c).strip().lower() in ("qty", "quantity")), None)
     if _qty_col_saw13 is not None:
-        _mask_5956 = out_export_saw13["material"].astype(str).str.strip() == "5956.05.00.4880"
+        _mask_5956 = out_export_saw13["material"].astype(str).str.strip().isin({
+            "5956.05.00.4880",
+            "5956L.05.00.4880",
+        })
         out_export_saw13.loc[_mask_5956, _qty_col_saw13] = 1
 
     saw13_excel_buf = io.BytesIO()
