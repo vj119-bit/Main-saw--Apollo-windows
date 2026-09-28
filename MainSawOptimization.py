@@ -1188,6 +1188,11 @@ def optimize_with_memory(df_in: pd.DataFrame, offcut_mem_df: pd.DataFrame, precu
     out_export_tigerstop = out_export.loc[tiger_mask].reset_index(drop=True)
     out_export_saw13 = out_export.loc[saw13_mask].reset_index(drop=True)
 
+    _qty_col_main = next((c for c in out_export_main.columns if str(c).strip().lower() in ("qty", "quantity")), None)
+    if _qty_col_main is not None:
+        _mask_5852 = out_export_main["material"].astype(str).str.strip().eq("5852.05.00.4880")
+        out_export_main.loc[_mask_5852, _qty_col_main] = 1
+
     # Keep all Saw #13 rows in the master sheet; flag sub-minimum rows for manual cut.
     if not out_export_saw13.empty:
         _saw13_len_num = pd.to_numeric(out_export_saw13["length"], errors="coerce")
